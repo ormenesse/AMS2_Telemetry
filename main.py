@@ -39,7 +39,7 @@ from contextlib import asynccontextmanager
 CREST_URL = os.environ.get("CREST_URL", "http://127.0.0.1:9000/api")
 POLL_HZ = float(os.environ.get("POLL_HZ", "10"))  # 10 Hz default
 
-app = FastAPI(title="AMS2 Telemetry Proxy", lifespan=lifespan)
+# app will be created after lifespan is defined
 
 # --- Data models for a clean, app‑friendly snapshot ---
 class CarSnapshot(BaseModel):
@@ -91,6 +91,9 @@ async def lifespan(app: FastAPI):
             t.join(timeout=1.0)
         except Exception:
             pass
+
+# Create FastAPI app AFTER lifespan is defined
+app = FastAPI(title="AMS2 Telemetry Proxy", lifespan=lifespan)
 
 
 
@@ -215,6 +218,11 @@ def poll_loop():
         time.sleep(interval)
 
 
+
+@app.get("/health")
+def health():
+    with _lock:
+        return {"ok": True, "has_snapshot": _latest is not None}
 
 @app.get("/api/telemetry", response_model=Snapshot)
 def get_snapshot():
