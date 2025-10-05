@@ -34,11 +34,12 @@ import requests
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 
 CREST_URL = os.environ.get("CREST_URL", "http://127.0.0.1:9000/api")
 POLL_HZ = float(os.environ.get("POLL_HZ", "10"))  # 10 Hz default
 
-app = FastAPI(title="AMS2 Telemetry Proxy")
+app = FastAPI(title="AMS2 Telemetry Proxy", lifespan=lifespan)
 
 # --- Data models for a clean, app‑friendly snapshot ---
 class CarSnapshot(BaseModel):
@@ -75,6 +76,22 @@ class Snapshot(BaseModel):
 _latest: Optional[Snapshot] = None
 _lock = threading.Lock()
 _stop = False
+
+# --- FastAPI lifespan (replaces deprecated on_event) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    t = threading.Thread(target=poll_loop, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        global _stop
+        _stop = True
+        try:
+            t.join(timeout=1.0)
+        except Exception:
+            pass
+
 
 
 # --- Helpers to safely read dicts ---
@@ -197,11 +214,6 @@ def poll_loop():
             pass
         time.sleep(interval)
 
-
-@app.on_event("startup")
-def _startup():
-    t = threading.Thread(target=poll_loop, daemon=True)
-    t.start()
 
 
 @app.get("/api/telemetry", response_model=Snapshot)
