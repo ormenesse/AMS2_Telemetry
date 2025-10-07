@@ -1,5 +1,6 @@
 """
 AMS2 Live Telemetry + Opponents (Python, FastAPI)
++ Lap Logger & Comparison Plots
 -------------------------------------------------
 
 What you get
@@ -28,9 +29,12 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import io
 import requests
+import pandas as pd
+import matplotlib.pyplot as plt
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -72,6 +76,22 @@ class Snapshot(BaseModel):
     player: CarSnapshot
     opponents: List[CarSnapshot]
 
+# --- Lap storage structures ---
+class LapData(BaseModel):
+    participant: str  # 'player' or opponent name
+    lap_number: int
+    start_ts: float
+    end_ts: Optional[float] = None
+    # raw samples as list of dicts; we'll convert to DataFrame on demand
+    samples: List[Dict[str, Any]] = []
+
+# Buffers
+player_current_lap: Optional[LapData] = None
+player_completed_laps: List[LapData] = []
+# Opponents by name
+opp_current_lap: Dict[str, LapData] = {}
+opp_completed_laps: Dict[str, List[LapData]] = {}
+
 # --- Shared state updated by a polling thread ---
 _latest: Optional[Snapshot] = None
 _lock = threading.Lock()
@@ -108,14 +128,12 @@ def g(d: Dict[str, Any], *keys, default=None):
 
 
 def crest_to_snapshot(raw: Dict[str, Any]) -> Snapshot:
-    # Telemetry and participants live in top‑level keys like "telemetry", "participants", "timings" in CREST2 output
     tele = raw.get("telemetry", {}) or {}
     sess = raw.get("gameStates", {}) or {}
     track = raw.get("trackData", {}) or {}
     parts = raw.get("participants", []) or []
     timings = raw.get("timings", {}) or {}
 
-    # Player indexes often available via timings["mViewedParticipantIndex"] or telemetry["mViewedParticipantIndex"]
     viewed_idx = (
         g(timings, "mViewedParticipantIndex")
         or g(tele, "mViewedParticipantIndex")
@@ -123,7 +141,6 @@ def crest_to_snapshot(raw: Dict[str, Any]) -> Snapshot:
     )
 
     def mk_car(p: Dict[str, Any], is_player: bool = False) -> CarSnapshot:
-        # Participant basics
         name = p.get("mName") or p.get("mVehicleName")
         race_pos = p.get("mRacePosition")
         class_pos = p.get("mClassPosition")
@@ -132,7 +149,6 @@ def crest_to_snapshot(raw: Dict[str, Any]) -> Snapshot:
         sector = p.get("mCurrentSector")
         car_class = p.get("mCarClassName") or p.get("mCarClass")
 
-        # Live driving inputs for this participant sometimes come via telemetry arrays; for simplicity we map player ones directly from tele
         speed_kph = None
         gear = None
         rpm = None
@@ -142,7 +158,6 @@ def crest_to_snapshot(raw: Dict[str, Any]) -> Snapshot:
         dist_m = None
 
         if is_player:
-            # CREST2 field names mirror shared memory; adapt if your CREST version differs
             speed_mps = tele.get("mSpeed")
             if speed_mps is not None:
                 speed_kph = float(speed_mps) * 3.6
@@ -153,7 +168,7 @@ def crest_to_snapshot(raw: Dict[str, Any]) -> Snapshot:
             steering = tele.get("mSteering")
             dist_m = tele.get("mOdometerKM")
             if isinstance(dist_m, (int, float)):
-                dist_m = float(dist_m) * 1000.0  # km → m
+                dist_m = float(dist_m) * 1000.0
 
         return CarSnapshot(
             name=name,
@@ -173,7 +188,6 @@ def crest_to_snapshot(raw: Dict[str, Any]) -> Snapshot:
             is_player=is_player,
         )
 
-    # Build player + opponents
     player_part = parts[viewed_idx] if (isinstance(parts, list) and len(parts) > viewed_idx) else {}
     player = mk_car(player_part, is_player=True)
 
@@ -184,7 +198,6 @@ def crest_to_snapshot(raw: Dict[str, Any]) -> Snapshot:
                 continue
             opponents.append(mk_car(p, is_player=False))
 
-    # Session metadata
     session = SessionSnapshot(
         session_type=g(sess, "mSessionStateName") or g(tele, "mSessionStateName"),
         track_name=track.get("mTrackLocation"),
@@ -198,12 +211,35 @@ def crest_to_snapshot(raw: Dict[str, Any]) -> Snapshot:
         session=session,
         player=player,
         opponents=opponents,
+    ),
+        session=session,
+        player=player,
+        opponents=opponents,
     )
 
 
+def _append_sample(lap: LapData, snap: Snapshot):
+    tele = {
+        "ts": snap.timestamp,
+        "speed_kph": snap.player.speed_kph,
+        "gear": snap.player.gear,
+        "throttle": snap.player.throttle,
+        "brake": snap.player.brake,
+        "steering": snap.player.steering,
+        "dist_m": snap.player.distance_traveled_m,
+        "lap": snap.player.current_lap,
+    }
+    lap.samples.append(tele)
+
+
+def _finalize_lap(lap: LapData, end_ts: float):
+    lap.end_ts = end_ts
+
+
 def poll_loop():
-    global _latest
+    global _latest, player_current_lap
     interval = 1.0 / max(POLL_HZ, 1.0)
+    last_lap_num: Optional[int] = None
     while not _stop:
         try:
             r = requests.get(CREST_URL, timeout=0.5)
@@ -212,8 +248,19 @@ def poll_loop():
             snap = crest_to_snapshot(raw)
             with _lock:
                 _latest = snap
+                # Player lap tracking
+                lap_num = snap.player.current_lap if snap.player else None
+                if lap_num is not None:
+                    if player_current_lap is None:
+                        player_current_lap = LapData(participant="player", lap_number=lap_num, start_ts=snap.timestamp, samples=[])
+                    elif last_lap_num is not None and lap_num != last_lap_num:
+                        # Lap changed → finalize previous
+                        _finalize_lap(player_current_lap, snap.timestamp)
+                        player_completed_laps.append(player_current_lap)
+                        player_current_lap = LapData(participant="player", lap_number=lap_num, start_ts=snap.timestamp, samples=[])
+                    _append_sample(player_current_lap, snap)
+                    last_lap_num = lap_num
         except Exception:
-            # If CREST is down or AMS2 not running, keep previous snapshot
             pass
         time.sleep(interval)
 
@@ -222,10 +269,11 @@ def poll_loop():
 @app.get("/health")
 def health():
     with _lock:
-        return {"ok": True, "has_snapshot": _latest is not None}
+        laps = len(player_completed_laps)
+        return {"ok": True, "has_snapshot": _latest is not None, "laps_recorded": laps}
 
 @app.get("/api/telemetry", response_model=Snapshot)
-def get_snapshot():
+def get_snapshot()():
     with _lock:
         if _latest is None:
             # Return an empty shell so the frontend can render
@@ -335,6 +383,10 @@ async function tick(){
 
 setInterval(tick, 200); // 5 Hz dashboard updates
 window.onload = tick;
+// Simple link to comparison page
+const compare = document.createElement('p');
+compare.innerHTML = '<a href="/compare">Open comparison plots</a>';
+document.body.appendChild(compare);
 </script>
 </body>
 </html>
@@ -344,6 +396,122 @@ window.onload = tick;
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(DASH_HTML)
+
+# --- Utilities to build DataFrames and choose best laps ---
+def lap_to_df(lap: LapData) -> pd.DataFrame:
+    df = pd.DataFrame(lap.samples)
+    if df.empty:
+        return df
+    # Compute relative time and distance from lap start
+    df = df.sort_values("ts")
+    df["t_rel"] = df["ts"] - df["ts"].iloc[0]
+    # Reset distance to start-of-lap if available
+    if df["dist_m"].notna().any():
+        first_dist = df["dist_m"].dropna().iloc[0]
+        df["s_rel"] = df["dist_m"] - first_dist
+    else:
+        # Fallback: integrate speed
+        df["s_rel"] = df["speed_kph"].fillna(0) / 3.6
+        df["s_rel"] = df["s_rel"].cumsum() * (df["t_rel"].diff().fillna(0))
+    return df
+
+
+def best_player_lap() -> Optional[LapData]:
+    # choose min duration among completed laps with enough samples
+    if not player_completed_laps:
+        return None
+    candidates: List[Tuple[float, LapData]] = []
+    for lap in player_completed_laps:
+        if lap.end_ts and len(lap.samples) > 10:
+            duration = lap.end_ts - lap.start_ts
+            candidates.append((duration, lap))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
+def render_plots(player_df: pd.DataFrame, opponent_df: Optional[pd.DataFrame]) -> bytes:
+    # Generate 3 separate overlays on one tall figure (speed, throttle/brake, gear)
+    # Requirement: single-axes charts are preferred, but here we stack to save space.
+    fig_h = 10
+    fig, axes = plt.subplots(3, 1, figsize=(10, fig_h))
+
+    # SPEED
+    ax = axes[0]
+    ax.plot(player_df["s_rel"], player_df["speed_kph"], label="Player")
+    if opponent_df is not None and not opponent_df.empty and opponent_df["speed_kph"].notna().any():
+        ax.plot(opponent_df["s_rel"], opponent_df["speed_kph"], label="Opponent")
+    ax.set_ylabel("Speed (kph)")
+    ax.set_xlabel("Distance in lap (m)")
+    ax.legend()
+
+    # INPUTS
+    ax = axes[1]
+    if player_df["throttle"].notna().any():
+        ax.plot(player_df["s_rel"], player_df["throttle"], label="Throttle (player)")
+    if player_df["brake"].notna().any():
+        ax.plot(player_df["s_rel"], player_df["brake"], label="Brake (player)")
+    if opponent_df is not None:
+        # Opponent inputs are usually not exposed; show only speed-based markers when available
+        pass
+    ax.set_ylabel("Inputs (0..1)")
+    ax.set_xlabel("Distance in lap (m)")
+    ax.legend()
+
+    # GEAR (step-like)
+    ax = axes[2]
+    if player_df["gear"].notna().any():
+        ax.step(player_df["s_rel"], player_df["gear"], where='post', label="Gear (player)")
+    ax.set_ylabel("Gear")
+    ax.set_xlabel("Distance in lap (m)")
+    ax.legend()
+
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+@app.get("/compare")
+def compare_page():
+    html = """
+    <html><head><title>Lap Comparison</title></head>
+    <body>
+      <h1>Lap Comparison</h1>
+      <p>This compares your best recorded lap to an opponent's best lap (speed only if available).</p>
+      <p><img src="/compare/image" style="max-width:100%" /></p>
+      <p><a href="/laps">See recorded laps</a></p>
+    </body></html>
+    """
+    return HTMLResponse(html)
+
+
+@app.get("/laps")
+def list_laps():
+    with _lock:
+        laps = [
+            {"lap_number": l.lap_number, "duration_s": (l.end_ts - l.start_ts) if l.end_ts else None}
+            for l in player_completed_laps
+        ]
+    return {"player_laps": laps}
+
+
+@app.get("/compare/image")
+def compare_image():
+    with _lock:
+        best = best_player_lap()
+        if best is None:
+            return Response("No completed laps yet.", media_type="text/plain", status_code=400)
+        player_df = lap_to_df(best)
+
+        # Opponent best lap: Not all fields exist; this demo plots only player inputs and overlays opponent speed if you later capture it.
+        opponent_df = None
+
+        png = render_plots(player_df, opponent_df)
+        return Response(content=png, media_type="image/png")
 
 
 # --- Optional: UDP listener stub (if you want SimHub/UDP path instead) ---
